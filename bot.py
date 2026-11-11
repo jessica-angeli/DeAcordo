@@ -16,10 +16,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config.approvers_map import APPROVERS_CONFIG, format_user_mention
-from config.exceptions_rules import EXCEPTIONS_RULES
+from config.exceptions_rules import EXCEPTIONS_RULES, aplicar_dispensa_por_divida
 from config.triagem_config import is_user_triagem
 from config.flow_config import FLUXO_CRESCIMENTO, FLUXO_RENOVACAO, resolver_tipo_fluxo
-from config.n3_config import DIRETORES_N3, MODO_ALTA_DEMANDA, N3_GENERICO, N3_MARCAR_APROVADORES, resolver_aprovadores_n3
+from config.n3_config import MODO_ALTA_DEMANDA, N3_GENERICO, N3_MARCAR_APROVADORES, escolher_diretor_do_pedido, resolver_aprovadores_n3
 from services.receita_service import consultar_cnpj
 from services.inep_service import buscar_inep
 from services.ticket_service import (
@@ -61,6 +61,8 @@ from views.modals import (
     MARCAS_PLUS,
 )
 from utils.currency_words import format_real_input, parse_currency_str, valor_para_extenso
+from utils.texto import neutralizar_mrkdwn
+from utils.links import link_do_google_drive
 
 # Configura logs
 logging.basicConfig(level=logging.INFO)
@@ -689,6 +691,10 @@ def handle_submission(ack, body, client):
     if not data.get("excecao_1"):
         errors["excecao_1_block"] = "Selecione a Exceção 1."
 
+    excecoes_selecionadas = [data.get(f"excecao_{i}") for i in range(1, num_exceptions + 1)]
+    if "Simulador - Inviabilidade ampliação" in excecoes_selecionadas and not data.get("lider_do_lider"):
+        errors["lider_do_lider_block"] = "Informe o Líder do Líder do Consultor (aprovador da exceção 'Simulador - Inviabilidade ampliação')."
+
     if tipo_fluxo == FLUXO_RENOVACAO:
         # Validação dos campos específicos da Renovação
         if data.get("reajuste_liquido") is None or str(data.get("reajuste_liquido")).strip() == "":
@@ -705,8 +711,8 @@ def handle_submission(ack, body, client):
                 errors[b_id] = f"Informe o percentual de inviabilidade para a marca {m}."
 
     sim_link = data.get("simulador_link") or ""
-    if not sim_link.startswith(("http://", "https://")):
-        errors["simulador_block"] = "Cole o link do Simulador no Google Drive (começando com https://)."
+    if not link_do_google_drive(sim_link):
+        errors["simulador_block"] = "Cole o link do Simulador no Google Drive (https://drive.google.com/... ou https://docs.google.com/...)."
 
     if errors:
         ack(response_action="errors", errors=errors)
@@ -715,9 +721,29 @@ def handle_submission(ack, body, client):
     # Formulário aprovado para envio!
     ack()
 
+    data = neutralizar_mrkdwn(data)
     channel_id = metadata.get("channel_id") or DEFAULT_CHANNEL_ID
     consultor_id = data.get("consultor") or body["user"]["id"]
     lider_id = data.get("lider")
+    lider_do_lider_id = data.get("lider_do_lider")
+
+    # Dívida informada, usada também pelas exceções com aprovação automática até R$ 50k
+    valor_divida_num = 0.0
+    if data.get("tem_divida") == "sim" and data.get("valor_divida"):
+        valor_divida_num = parse_currency_str(data.get("valor_divida")) or 0.0
+
+    # Exceção que já leva a dívida alta a um validador próprio (ex.: Modalidade de venda -> Matheus).
+    # Nesse caso a alçada geral de dívida (Rafael Bae) não é criada.
+    divida_validada_por_excecao = False
+
+    # Diretoria N3 (Chalfun/Faleiros) em rodízio: um único diretor por pedido, não "qualquer um decide".
+    # Cacheado aqui porque pode haver mais de uma exceção na Diretoria N3 no mesmo pedido.
+    _diretor_n3_do_pedido = {}
+
+    def _diretor_n3():
+        if not _diretor_n3_do_pedido:
+            _diretor_n3_do_pedido["valor"] = escolher_diretor_do_pedido()
+        return _diretor_n3_do_pedido["valor"]
 
     # Mapeamento dos Aprovadores das Exceções selecionadas
     excecoes_detalhes = []
@@ -737,6 +763,10 @@ def handle_submission(ack, body, client):
             "ops_approver": None,
         })
 
+        rule, dispensa = aplicar_dispensa_por_divida(rule, valor_divida_num)
+        if rule.get("automatica_ate_50k") and not dispensa:
+            divida_validada_por_excecao = True
+
         # Resolve Aprovador Comercial
         aprov_com = rule.get("comercial_approver")
         com_tag = "-"
@@ -744,10 +774,14 @@ def handle_submission(ack, body, client):
             lider_tag = format_mention(lider_id)
             com_tag = f"{lider_tag} (Líder Direto)"
             aprovadores_para_marcar.add(lider_tag)
+        elif aprov_com == "LIDER_DO_LIDER":
+            lider_lider_tag = format_mention(lider_do_lider_id)
+            com_tag = f"{lider_lider_tag} (Líder do Líder)"
+            aprovadores_para_marcar.add(lider_lider_tag)
         elif aprov_com == N3_GENERICO:
-            com_tag = " ou ".join(
-                f"<@{d['slack_id']}>" if (N3_MARCAR_APROVADORES and d["slack_id"]) else f"@{d['nome']}"
-                for d in DIRETORES_N3
+            diretor = _diretor_n3()
+            com_tag = (
+                f"<@{diretor['slack_id']}>" if (N3_MARCAR_APROVADORES and diretor.get("slack_id")) else f"@{diretor['nome']}"
             )
         elif aprov_com:
             com_tag = format_user_mention(aprov_com)
@@ -770,6 +804,7 @@ def handle_submission(ack, body, client):
             "aprov_ops_tag": ops_tag,
             "aprov_com_nome": aprov_com,
             "aprov_ops_nome": aprov_ops,
+            "dispensa": dispensa,
         })
 
     # Versão estruturada das exceções, para salvar no ticket (fora do texto livre)
@@ -831,7 +866,8 @@ def handle_submission(ack, body, client):
         val_div_num = parse_currency_str(data.get("valor_divida")) or 0.0
         if val_div_num > 50000.0:
             tem_divida_alta = True
-            aprovadores_para_marcar.add(aprovador_bae)
+            if not divida_validada_por_excecao:
+                aprovadores_para_marcar.add(aprovador_bae)
 
     # Dados cadastrais e complementares
     cnpj_formatado = data.get('cnpj') or 'Não informado'
@@ -999,7 +1035,9 @@ def handle_submission(ack, body, client):
     for item in excecoes_detalhes:
         if item.get("aprov_com_nome") or item.get("aprov_ops_nome"):
             continue
-        if "não precisa" in str(item.get("regra_comercial", "")).lower():
+        if item.get("dispensa"):
+            linha = f"➖ Exceção {item['numero']} · {item['nome'][:70]} · {item['dispensa']}"
+        elif "não precisa" in str(item.get("regra_comercial", "")).lower():
             linha = f"➖ Exceção {item['numero']} · {item['nome'][:70]} · não precisa de aprovação"
         else:
             linha = f"⚠️ Exceção {item['numero']} · {item['nome'][:70]} · sem aprovador definido na regra"
@@ -1036,9 +1074,13 @@ def handle_submission(ack, body, client):
     })
 
     # Uma alçada por exceção (e por aprovador dela): reprovar uma exceção não encerra o pedido
+    lider_do_lider_display = "Líder do Líder" if (not lider_do_lider_id or lider_do_lider_id.startswith(("U", "W"))) else lider_do_lider_id
+
     def _aprovador_excecao(nome_regra):
         if nome_regra == "LIDER_DIRETO":
             return (lider_id if (lider_id and lider_id.startswith(("U", "W"))) else ""), lider_display
+        if nome_regra == "LIDER_DO_LIDER":
+            return (lider_do_lider_id if (lider_do_lider_id and lider_do_lider_id.startswith(("U", "W"))) else ""), lider_do_lider_display
         slack_id = (APPROVERS_CONFIG.get(nome_regra) or {}).get("slack_id") or ""
         return slack_id, nome_regra
 
@@ -1050,14 +1092,13 @@ def handle_submission(ack, body, client):
             if not nome_regra:
                 continue
             if nome_regra == N3_GENERICO and not (MODO_ALTA_DEMANDA and aprovadores_n3):
-                ids_diretores = [d["slack_id"] for d in DIRETORES_N3 if d["slack_id"]] if N3_MARCAR_APROVADORES else []
+                diretor = _diretor_n3()
                 approvals_list.append({
-                    "key": f"excecao_{item['numero']}_com",
-                    "role_title": f"{titulo} (Diretoria N3)"[:140],
-                    "short_label": f"Exceção {item['numero']} (Diretoria)",
-                    "approver_id": ids_diretores[0] if ids_diretores else "",
-                    "approver_ids": ids_diretores,
-                    "approver_name": " ou ".join(d["nome"] for d in DIRETORES_N3),
+                    "key": f"excecao_{item['numero']}_{sufixo}",
+                    "role_title": f"{titulo} (Diretoria N3 - {diretor['nome']})"[:140],
+                    "short_label": f"Exceção {item['numero']} (Diretoria - {diretor['nome']})"[:60],
+                    "approver_id": diretor["slack_id"] if N3_MARCAR_APROVADORES else "",
+                    "approver_name": diretor["nome"],
                     "scope_reason": f"Exceção {item['numero']}: {item['nome']}. Contexto: {item['contexto']}",
                     "parcial": True,
                 })
@@ -1129,7 +1170,7 @@ def handle_submission(ack, body, client):
             })
 
     # Alçada Especial Dívida (> R$ 50k)
-    if tem_divida_alta:
+    if tem_divida_alta and not divida_validada_por_excecao:
         divida_val_display = divida_fmt if (data.get("tem_divida") == "sim" and data.get("valor_divida")) else "Acima de R$ 50k"
         approvals_list.append({
             "key": "divida_bae",
@@ -1751,7 +1792,7 @@ def handle_view_reprovar_ticket(ack, body, client, view):
 
     # Obtém justificativa / detalhes
     detalhes_elem = values.get("detalhes_reprovacao_block", {}).get("detalhes_reprovacao_input", {})
-    detalhes = detalhes_elem.get("value") or ""
+    detalhes = neutralizar_mrkdwn(detalhes_elem.get("value") or "")
 
     errors = {}
     if not reason_key:
@@ -1793,6 +1834,13 @@ def handle_view_reprovar_ticket(ack, body, client, view):
 
     if not res.get("success"):
         logger.error(f"Erro ao rejeitar ticket {ticket_key}: {res.get('error')}")
+        return
+    if res.get("already_decided"):
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=user_id,
+                text="Essa alçada já tinha sido decidida antes do envio da reprovação. Nada foi alterado.")
+        except Exception as e:
+            logger.warning(f"Aviso de alçada já decidida não enviado: {e}")
         return
 
     updated_ticket = res["ticket"]
@@ -2122,7 +2170,7 @@ def handle_view_triagem_substituicao(ack, body, client, view):
 
     # 4. Motivo
     motivo_elem = values.get("motivo_ausencia_block", {}).get("motivo_ausencia_input", {})
-    motivo_ausencia = (motivo_elem.get("value") or "").strip()
+    motivo_ausencia = neutralizar_mrkdwn((motivo_elem.get("value") or "").strip())
 
     ticket_for_validation = get_ticket(ticket_key)
     consultor_id_check = ticket_for_validation.get("consultor_id") if ticket_for_validation else None
@@ -2301,7 +2349,7 @@ def handle_msg_painel(message, client):
 
 if __name__ == "__main__":
     from services.sheets_service import is_enabled as sheets_enabled
-    logger.info("📊 Planilha do Google: " + ("ATIVA" if sheets_enabled() else "desligada (sem GOOGLE_SHEET_ID ou google_credentials.json)"))
+    logger.info("📊 Planilha do Google: " + ("ATIVA" if sheets_enabled() else "desligada (sem GOOGLE_SHEET_ID ou credencial do Google)"))
     from services.ticket_service import modo_botoes_post
     logger.info(f"🔘 Botões do post: {modo_botoes_post()} (POST_BOTOES no .env: unico = opção A, por_alcada = opção B)")
     try:
@@ -2319,4 +2367,6 @@ if __name__ == "__main__":
 
     logger.info("⚡ Iniciando o Slack Bot em Socket Mode...")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    from services.health_service import start_health_server
+    start_health_server(lambda: handler.client.is_connected())
     handler.start()
